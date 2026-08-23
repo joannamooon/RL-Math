@@ -1,75 +1,154 @@
-# Alignment — Reasoning RL
+# RL-Math — Reasoning RL with GRPO
 
-Post-training a language model with GRPO (Group Relative Policy Optimization) to improve
-math-reasoning accuracy on GSM8K, starting from the OLMo-2-0425-1B base model.
+Post-training a language model with **GRPO** (Group Relative Policy Optimization) to improve math-reasoning accuracy on GSM8K, starting from the [OLMo-2-0425-1B](https://huggingface.co/allenai/OLMo-2-0425-1B) base model.
 
-Built for Stanford's CS336 (Language Models from Scratch), Assignment 5.
+Built for Stanford CS336 (Language Models from Scratch), Assignment 5.
 
-## What's here
+## Overview
 
-- **Prompting**: zero-shot / few-shot / chain-of-thought prompting of the base model on GSM8K.
-- **GRPO**: on-policy policy-gradient training loop (rollout via vLLM, gradient steps via
-  HuggingFace `transformers`), including group-mean baselines, advantage normalization
-  (std/mean/none), and sequence vs. constant loss normalization.
-- **RL algorithm variants**: Dr. GRPO, RFT (rejection fine-tuning), MaxRL — same training loop,
-  different baseline/normalization choices.
-- **Off-policy RL**: multiple gradient steps per rollout batch, with PPO/GRPO-style clipped
-  token-level importance reweighting and GSPO-style clipped sequence-level reweighting.
+This repo implements a full RL training stack for math reasoning:
+
+- **Rollouts** via a vLLM inference server (fast batched generation)
+- **Policy updates** via HuggingFace `transformers` (gradient steps on the training GPU)
+- **Weight sync** between the trainer and vLLM over NCCL
+
+Supported training modes:
+
+| Mode | Key flags |
+|---|---|
+| On-policy GRPO | `--num-gradient-steps 1` (default) |
+| Dr. GRPO | `--baseline none --advantage-normalizer none --loss-normalization constant` |
+| MaxRL | `--advantage-normalizer mean` |
+| Off-policy (naive) | `--num-gradient-steps 32 --importance-reweighting-method none` |
+| Off-policy (GRPO-clip) | `--num-gradient-steps 32 --importance-reweighting-method grpo --cliprange 0.2` |
+| Off-policy (GSPO-clip) | `--num-gradient-steps 32 --importance-reweighting-method gspo --cliprange 0.2` |
 
 ## Repo layout
 
 ```
-cs336_alignment/
-  vllm_utils.py         vLLM server lifecycle, generation, NCCL weight sync
-  checkpoint.py          load/save HF model + tokenizer
-  drgrpo_grader.py        math-answer grading (r1_zero_reward_fn, question_only_reward_fn)
-  prompts/                r1_zero, r1_zero_three_shot, question_only prompt templates
-  prompts_safety/         prompt templates for the optional safety/RLHF supplement
-tests/
-  adapters.py             implementation hooks — connects your code to the test suite
-  test_grpo.py             required tests
-  test_data.py, test_dpo.py, test_metrics.py    optional supplement tests
-scripts/
-  prompting_baselines.py  eval OLMo-2-0425-1B on GSM8K across prompting strategies
-  train_grpo.py            full GRPO training loop (on- and off-policy, all variants)
-  evaluate_safety.py      optional supplement: LLaMA-judged safety eval
-data/                      GSM8K, MMLU, AlpacaEval, HH, SimpleSafetyTests
+src/
+  grpo.py                 GRPO utilities (tokenization, rewards, loss, train step)
+  vllm_utils.py           vLLM server lifecycle, generation, NCCL weight sync
+  checkpoint.py           load HF model + tokenizer
+  drgrpo_grader.py        math-answer grading and reward functions
+  modal_utils.py          Modal job helpers for cloud GPU runs
+  prompts/                r1_zero, r1_zero_three_shot, question_only templates
+  scripts/
+    train_grpo.py         full GRPO training loop
+    modal_train_grpo.py   launch training jobs on Modal
+    prompting_baselines.py  eval base model prompting strategies on GSM8K
+data/
+  gsm8k/
+    train.jsonl
+    test.jsonl
 ```
 
 ## Setup
 
-Uses `uv` for dependency management.
+Uses [uv](https://docs.astral.sh/uv/) for dependency management. GPU extras (vLLM, flash-attn, wandb) are required for training.
 
 ```sh
 uv sync --no-install-package flash-attn
-uv sync
+uv sync --extra gpu
 ```
 
-## Running things
+Training requires **2 GPUs**:
 
-Prompting baselines (zero-shot `question_only`, zero-shot `r1_zero`, few-shot `r1_zero_three_shot`):
+- `cuda:0` — HuggingFace policy + optimizer
+- GPU 1 — vLLM rollout server
+
+## Running locally
+
+Set `PYTHONPATH=src` so scripts can import the project modules.
+
+### Prompting baselines
+
+Evaluate the base model with zero-shot `question_only`, zero-shot `r1_zero`, or few-shot `r1_zero_three_shot` prompts:
 
 ```sh
-uv run python scripts/prompting_baselines.py --model-id allenai/OLMo-2-0425-1B
+PYTHONPATH=src uv run python src/scripts/prompting_baselines.py
 ```
 
-On-policy GRPO training on GSM8K:
+### On-policy GRPO training
 
 ```sh
-uv run python scripts/train_grpo.py \
+PYTHONPATH=src uv run python src/scripts/train_grpo.py \
     --model-id allenai/OLMo-2-0425-1B \
     --prompt r1_zero \
+    --seed 0 \
     --wandb-project cs336-a5-grpo
 ```
 
-RL variants and off-policy training reuse the same script — see the flags in
-`scripts/train_grpo.py` (`--baseline`, `--advantage-normalizer`, `--loss-normalization`,
-`--importance-reweighting-method`, `--cliprange`, `--train-batch-size`,
-`--gradient-accumulation-steps`) and the "Empirical problems" section of `WRITEUP.md` for the
-exact configs used for each experiment (Dr. GRPO, RFT, MaxRL, off-policy naive/noclip/grpo/gspo).
+### RL algorithm variants
 
-Training requires 2 GPUs (one for the HuggingFace policy/optimizer, one for the vLLM rollout
-server) and, for the full experiment sweeps in the handout, substantial B200 GPU time.
+Dr. GRPO:
+
+```sh
+PYTHONPATH=src uv run python src/scripts/train_grpo.py \
+    --prompt r1_zero \
+    --baseline none \
+    --advantage-normalizer none \
+    --loss-normalization constant
+```
+
+Off-policy with GRPO-style clipping:
+
+```sh
+PYTHONPATH=src uv run python src/scripts/train_grpo.py \
+    --prompt r1_zero \
+    --num-gradient-steps 32 \
+    --importance-reweighting-method grpo \
+    --cliprange 0.2
+```
+
+Run `PYTHONPATH=src uv run python src/scripts/train_grpo.py --help` for all options.
+
+### Training loop
+
+Each rollout step:
+
+1. Sample a batch of GSM8K questions and format them with the chosen prompt template
+2. Sync policy weights to vLLM
+3. Generate `group_size` completions per prompt (default 8)
+4. Score completions with the prompt's reward function
+5. Compute group-normalized advantages and run a policy-gradient update
+6. Log train/val metrics to Weights & Biases
+
+Default hyperparameters: 200 rollout steps, batch size 256 (32 prompts × 8 completions), learning rate `1e-5`, 6400 training examples.
+
+For off-policy training, `old_log_probs` are computed once after each rollout and reused across all gradient steps in that batch, so importance ratios stay anchored to the rollout policy.
+
+## Modal (cloud GPUs)
+
+To launch sweeps on Modal B200 instances, set your SUNET ID in `src/modal_utils.py`, then:
+
+```sh
+uv run modal run src/scripts/modal_train_grpo.py \
+    --seeds 0,1,2,3 \
+    --prompt r1_zero \
+    --extra-args "--baseline none --advantage-normalizer none --loss-normalization constant"
+```
+
+This submits one job per seed. W&B credentials are read from a Modal secret named `wandb`.
+
+## Key CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model-id` | `allenai/OLMo-2-0425-1B` | Base model to train |
+| `--prompt` | `r1_zero` | Prompt template (`r1_zero`, `r1_zero_three_shot`, `question_only`) |
+| `--train-batch-size` | `256` | Total completions per rollout step |
+| `--group-size` | `8` | Completions sampled per prompt |
+| `--num-rollout-steps` | `200` | Number of rollout/update cycles |
+| `--num-gradient-steps` | `1` | Gradient steps per rollout (off-policy when > 1) |
+| `--gradient-accumulation-steps` | `32` | Microbatches per gradient step |
+| `--baseline` | `mean` | Group baseline for advantages (`mean`, `none`) |
+| `--advantage-normalizer` | `std` | Advantage scaling (`std`, `mean`, `none`) |
+| `--loss-normalization` | `sequence` | Loss denominator (`sequence`, `constant`) |
+| `--importance-reweighting-method` | `none` | Off-policy correction (`none`, `noclip`, `grpo`, `gspo`) |
+| `--cliprange` | `None` | Clip range for `grpo` / `gspo` reweighting |
+| `--policy-device` | `cuda:0` | Device for the training policy |
+| `--vllm-gpu` | `1` | GPU index for the vLLM server |
 
 ## Results
 
@@ -82,6 +161,6 @@ server) and, for the full experiment sweeps in the handout, substantial B200 GPU
 | Dr. GRPO | 26% ± 4% | similar mean, slightly higher seed variance than GRPO |
 | RFT | 22% ± 5% | slower/noisier, no negative-sample signal |
 | MaxRL | 28% ± 3% | modest gain from upweighting hard prompts |
-| Off-policy naive (32x, no reweighting) | 18% ± 6% | biased, degrades vs. on-policy |
+| Off-policy naive (32×, no reweighting) | 18% ± 6% | biased, degrades vs. on-policy |
 | Off-policy, GRPO-clip | 25% ± 4% | recovers most of on-policy performance |
 | Off-policy, GSPO-clip | 26% ± 3% | most stable off-policy variant, lowest clip fraction |
